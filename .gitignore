@@ -1,5 +1,6 @@
 *~
 *.o
+.kilo/
 Makefile
 Makefile.in
 hydra
