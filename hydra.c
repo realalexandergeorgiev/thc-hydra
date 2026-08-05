@@ -215,7 +215,7 @@ char *SERVICES = "adam6500 asterisk afp cisco cisco-enable cobaltstrike cvs fire
 
 #define MAXBUF 520
 #define MAXLINESIZE ((MAXBUF / 2) - 4)
-#define MAXTASKS 64
+#define MAXTASKS 256
 #define MAXSERVERS 16
 #define MAXFAIL 3
 #define MAXENDWAIT 20
