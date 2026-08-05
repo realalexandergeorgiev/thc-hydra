@@ -247,11 +247,14 @@ extern int32_t do_retry;
 extern int32_t old_ssl;
 
 void hydra_kill_head(int32_t head_no, int32_t killit, int32_t fail);
+void hydra_skip_target_blocked(int32_t target_no);
+void hydra_add_found(int32_t port, char *service, char *target, char *miscptr, char *login, char *password);
+void hydra_print_found_all(void);
 
 // some enum definitions
 typedef enum { HEAD_DISABLED = -1, HEAD_UNUSED = 0, HEAD_ACTIVE = 1 } head_state_t;
 
-typedef enum { TARGET_ACTIVE = 0, TARGET_FINISHED = 1, TARGET_ERROR = 2, TARGET_UNRESOLVED = 3 } target_state_t;
+typedef enum { TARGET_ACTIVE = 0, TARGET_FINISHED = 1, TARGET_ERROR = 2, TARGET_UNRESOLVED = 3, TARGET_BLOCKED = 4 } target_state_t;
 
 // some structure definitions
 typedef struct {
@@ -313,6 +316,28 @@ typedef struct {
   int32_t port_ssl;
 } hydra_portlist;
 
+// per-target rate measurement state for the -j (min tries/sec) check.
+// transient runtime state, not persisted to the restore file.
+typedef struct {
+  time_t since;     // timestamp the current measurement window started; 0 = warmup
+  uint64_t base;    // hydra_targets[target_no]->sent value at 'since'
+  int32_t slow;     // consecutive sub-threshold windows
+} rate_state_t;
+
+// a successfully guessed login/password pair, stored so all found credentials
+// can be re-printed at the end of the run.
+typedef struct {
+  int32_t port;
+  char *service;
+  char *target;
+  char *miscptr;
+  char *login;
+  char *password;
+} hydra_found;
+
+#define RATE_WINDOW_SEC 3  // length of one rate-measurement window in seconds
+#define RATE_SLOW_LIMIT 2 // consecutive slow windows before a target is skipped
+
 // external vars
 extern const unsigned char HYDRA_EXIT[5];
 #if !defined(ANDROID) && !defined(__BIONIC__)
@@ -344,6 +369,12 @@ char *sck = NULL;
 int32_t prefer_ipv6 = 0, conwait = 0, loop_cnt = 0, fck = 0, options = 0, killed = 0;
 int32_t child_head_no = -1, child_socket;
 int32_t total_redo_count = 0;
+int32_t min_rate = 0; // -j N: minimum tries/sec per target; 0 = disabled
+rate_state_t *rate_state = NULL;
+
+// list of found login/password pairs, re-printed at the end of the run
+hydra_found *found_list = NULL;
+uint64_t found_count = 0, found_cap = 0;
 
 // requred for distributed attack capability
 uint32_t num_segments = 0;
@@ -493,7 +524,7 @@ void help(int32_t ext) {
 #ifdef HAVE_MATH_H
                     " [-x MIN:MAX:CHARSET]"
 #endif
-                    " [-c TIME] [-ISOuvVd46] [-m MODULE_OPT] "
+                    " [-c TIME] [-j N] [-ISOuvVd46] [-m MODULE_OPT] "
                     //"[server service [OPT]]|"
                     "[service://server[:PORT][/OPT]]\n");
   PRINT_NORMAL(ext, "\nOptions:\n");
@@ -540,11 +571,15 @@ void help(int32_t ext) {
                "  -w / -W TIME  wait time for a response (%d) / between connects per "
                "thread (%d)\n"
 #ifdef MSG_PEEK
-               "  -c TIME   wait time per login attempt over all threads (enforces -t "
-               "1)\n"
+                "  -c TIME   wait time per login attempt over all threads (enforces -t "
+                "1)\n"
 #endif
-               "  -4 / -6   use IPv4 (default) / IPv6 addresses (put always in [] also "
-               "in -M)\n"
+                "  -j N      minimum tries per second per target; if the rate stays "
+                "below N\n"
+                "            the target is skipped (assumed blocked/throttled, e.g. "
+                "fail2ban)\n"
+                "  -4 / -6   use IPv4 (default) / IPv6 addresses (put always in [] also "
+                "in -M)\n"
                "  -v / -V / -d  verbose mode / show login+pass for each attempt / debug "
                "mode \n"
                "  -O        use old SSL v2 and v3\n"
@@ -650,9 +685,9 @@ void hydra_debug(int32_t force, char *string) {
 
   printf("[DEBUG] Code: %s   Time: %" hPRIu64 "\n", string, (uint64_t)time(NULL));
   printf("[DEBUG] Options: mode %d  ssl %d  restore %d  showAttempt %d  tasks "
-         "%d  max_use %d tnp %d  tpsal %d  tprl %d  exit_found %d  miscptr %s  "
-         "service %s\n",
-         hydra_options.mode, hydra_options.ssl, hydra_options.restore, hydra_options.showAttempt, hydra_options.tasks, hydra_options.max_use, hydra_options.try_null_password, hydra_options.try_password_same_as_login, hydra_options.try_password_reverse_login, hydra_options.exit_found, STR_NULL(hydra_options.miscptr), hydra_options.service);
+         "%d  max_use %d tnp %d  tpsal %d  tprl %d  exit_found %d  min_rate %d "
+         "miscptr %s  service %s\n",
+         hydra_options.mode, hydra_options.ssl, hydra_options.restore, hydra_options.showAttempt, hydra_options.tasks, hydra_options.max_use, hydra_options.try_null_password, hydra_options.try_password_same_as_login, hydra_options.try_password_reverse_login, hydra_options.exit_found, min_rate, STR_NULL(hydra_options.miscptr), hydra_options.service);
 
   printf("[DEBUG] Brains: active %d  targets %d  finished %d  todo_all %" hPRIu64 "  todo %" hPRIu64 "  sent %" hPRIu64 "  found %" hPRIu64 "  countlogin %" hPRIu64 "  sizelogin %" hPRIu64 "  countpass %" hPRIu64 "  sizepass %" hPRIu64 "\n", hydra_brains.active, hydra_brains.targets, hydra_brains.finished, hydra_brains.todo_all + total_redo_count, hydra_brains.todo, hydra_brains.sent, hydra_brains.found, (uint64_t)hydra_brains.countlogin, (uint64_t)hydra_brains.sizelogin, (uint64_t)hydra_brains.countpass,
          (uint64_t)hydra_brains.sizepass);
@@ -1568,6 +1603,90 @@ void hydra_kill_head(int32_t head_no, int32_t killit, int32_t fail) {
   sigprocmask(SIG_SETMASK, &prevmask, NULL);
 }
 
+static char *safe_strdup_found(char *s) { return s ? strdup(s) : strdup(""); }
+
+void hydra_add_found(int32_t port, char *service, char *target, char *miscptr, char *login, char *password) {
+  hydra_found *tmp;
+
+  if (found_count >= found_cap) {
+    found_cap = found_cap ? found_cap * 2 : 8;
+    tmp = (hydra_found *)realloc(found_list, found_cap * sizeof(hydra_found));
+    if (tmp == NULL) {
+      fprintf(stderr, "[ERROR] realloc(found_list) failed\n");
+      return;
+    }
+    found_list = tmp;
+  }
+  found_list[found_count].port = port;
+  found_list[found_count].service = safe_strdup_found(service);
+  found_list[found_count].target = safe_strdup_found(target);
+  found_list[found_count].miscptr = safe_strdup_found(miscptr);
+  found_list[found_count].login = safe_strdup_found(login);
+  found_list[found_count].password = safe_strdup_found(password);
+  found_count++;
+}
+
+void hydra_print_found_all(void) {
+  uint64_t i;
+  hydra_found *f;
+
+  if (found_count == 0)
+    return;
+  printf("Valid credentials found:\n");
+  for (i = 0; i < found_count; i++) {
+    f = &found_list[i];
+    if (colored_output) {
+      if (f->login[0] == 0) {
+        if (f->password[0] == 0)
+          printf("[\e[1;32m%d\e[0m][\e[1;32m%s\e[0m] host: \e[1;32m%s\e[0m\n", f->port, f->service, f->target);
+        else
+          printf("[\e[1;32m%d\e[0m][\e[1;32m%s\e[0m] host: \e[1;32m%s\e[0m   password: \e[1;32m%s\e[0m\n", f->port, f->service, f->target, f->password);
+      } else if (f->password[0] == 0) {
+        printf("[\e[1;32m%d\e[0m][\e[1;32m%s\e[0m] host: \e[1;32m%s\e[0m   login: \e[1;32m%s\e[0m\n", f->port, f->service, f->target, f->login);
+      } else
+        printf("[\e[1;32m%d\e[0m][\e[1;32m%s\e[0m] host: \e[1;32m%s\e[0m   login: \e[1;32m%s\e[0m   password: \e[1;32m%s\e[0m\n", f->port, f->service, f->target, f->login, f->password);
+    } else {
+      if (f->login[0] == 0) {
+        if (f->password[0] == 0)
+          printf("[%d][%s] host: %s\n", f->port, f->service, f->target);
+        else
+          printf("[%d][%s] host: %s   password: %s\n", f->port, f->service, f->target, f->password);
+      } else if (f->password[0] == 0) {
+        printf("[%d][%s] host: %s   login: %s\n", f->port, f->service, f->target, f->login);
+      } else
+        printf("[%d][%s] host: %s   login: %s   password: %s\n", f->port, f->service, f->target, f->login, f->password);
+    }
+  }
+}
+
+void hydra_skip_target_blocked(int32_t target_no) {
+  int32_t j;
+
+  if (target_no < 0 || target_no >= hydra_brains.targets)
+    return;
+  if (hydra_targets[target_no]->done != TARGET_ACTIVE)
+    return;
+
+  hydra_targets[target_no]->done = TARGET_BLOCKED;
+  hydra_brains.finished++;
+  fprintf(stderr,
+          "[STATUS] Disabling target %s://%s%s%s:%d: rate below minimum %d "
+          "tries/sec (-j); probably blocked/throttled\n",
+          hydra_options.service,
+          hydra_targets[target_no]->ip[0] == 16 && strchr(hydra_targets[target_no]->target, ':') != NULL ? "[" : "",
+          hydra_targets[target_no]->target,
+          hydra_targets[target_no]->ip[0] == 16 && strchr(hydra_targets[target_no]->target, ':') != NULL ? "]" : "",
+          hydra_targets[target_no]->port, min_rate);
+
+  for (j = 0; j < hydra_options.max_use; j++)
+    if (hydra_heads[j]->active >= HEAD_UNUSED && hydra_heads[j]->target_no == target_no) {
+      if (hydra_brains.targets > hydra_brains.finished)
+        hydra_kill_head(j, 1, 0);
+      else
+        hydra_kill_head(j, 1, 2);
+    }
+}
+
 void hydra_increase_fail_count(int32_t target_no, int32_t head_no) {
   int32_t i, k, maxfail = 0;
 
@@ -2356,8 +2475,11 @@ int main(int argc, char *argv[]) {
   FILE *lfp = NULL, *pfp = NULL, *cfp = NULL, *ifp = NULL, *rfp = NULL, *proxyfp, *filecloser = NULL;
   size_t countinfile = 1, sizeinfile = 0;
   uint64_t math2;
-  int32_t i = 0, j = 0, k, error = 0, modusage = 0, ignore_restore = 0, do_switch;
+  int32_t i = 0, j = 0, k, error = 0, modusage = 0, ignore_restore = 0, do_switch, blocked = 0;
   int32_t head_no = 0, target_no = 0, exit_condition = 0, readres, active_heads = 0;
+  int32_t rt, rate_dt;
+  uint64_t rate_attempts;
+  double rate_val;
   time_t starttime, elapsed_status, elapsed_restore, status_print = 59, tmp_time;
   char *tmpptr, *tmpptr2, *tmpptr3;
   char rc, buf[MAXBUF];
@@ -2497,13 +2619,14 @@ int main(int argc, char *argv[]) {
   hydra_brains.targets = 1;
   hydra_options.waittime = waittime = WAITTIME;
   bf_options.disable_symbols = 0;
+  min_rate = 0;
 
   // command line processing
   if (argc > 1 && strncmp(argv[1], "-h", 2) == 0)
     help(1);
   if (argc < 2)
     help(0);
-  while ((i = getopt(argc, argv, "hIq64Rrde:vVl:fFg:D:L:p:OP:o:b:M:C:t:T:m:w:W:s:SUux:yc:K")) >= 0) {
+  while ((i = getopt(argc, argv, "hIq64Rrde:vVl:fFg:D:L:p:OP:o:b:M:C:t:T:m:w:W:s:SUux:yc:Kj:")) >= 0) {
     switch (i) {
     case 'D':
       hydra_options.distributed = optarg;
@@ -2522,6 +2645,13 @@ int main(int argc, char *argv[]) {
       break;
     case 'K':
       hydra_options.skip_redo = 1;
+      break;
+    case 'j':
+      min_rate = atoi(optarg);
+      if (min_rate < 0) {
+        fprintf(stderr, "[ERROR] -j must be >= 0\n");
+        exit(-1);
+      }
       break;
     case 'O':
       old_ssl = 1;
@@ -2749,6 +2879,11 @@ int main(int argc, char *argv[]) {
   if (hydra_options.tasks > 1 && hydra_options.time_next_attempt)
     fprintf(stderr, "[WARNING] when using the -c option, you should also set "
                     "the task per target to one (-t 1)\n");
+  if (min_rate > 0 && hydra_options.time_next_attempt > 0) {
+    fprintf(stderr, "[WARNING] -j (min rate) disabled because -c caps the rate "
+                    "manually; cannot detect blocking while -c is active\n");
+    min_rate = 0;
+  }
   if (hydra_options.login != NULL && hydra_options.loginfile != NULL)
     bail("You can only use -L OR -l, not both\n");
   if (hydra_options.pass != NULL && hydra_options.passfile != NULL)
@@ -4248,6 +4383,14 @@ int main(int argc, char *argv[]) {
   hydra_debug(0, "attack");
   process_restore = 1;
 
+  if (min_rate > 0 && hydra_brains.targets > 0) {
+    rate_state = (rate_state_t *)calloc(hydra_brains.targets, sizeof(rate_state_t));
+    if (rate_state == NULL) {
+      fprintf(stderr, "[ERROR] calloc(rate_state) failed\n");
+      exit(-1);
+    }
+  }
+
   // this is the big function which starts the attacking children, feeds
   // login/password pairs, etc.!
   while (exit_condition == 0) {
@@ -4263,6 +4406,40 @@ int main(int argc, char *argv[]) {
     }
     my_select(max_fd + 1, &fdreadheads, NULL, NULL, 0, 200000);
     tmp_time = time(NULL);
+
+    // -j N: per-target minimum tries/sec check. Skip targets that stay below
+    // the threshold (assumed blocked/throttled, e.g. by fail2ban).
+    if (min_rate > 0 && rate_state != NULL) {
+      for (rt = 0; rt < hydra_brains.targets; rt++) {
+        if (hydra_targets[rt]->done != TARGET_ACTIVE)
+          continue;
+        if (hydra_targets[rt]->sent == 0)
+          continue; // warmup: not started yet
+        if (rate_state[rt].since == 0) { // first attempt observed -> start window
+          rate_state[rt].since = tmp_time;
+          rate_state[rt].base = hydra_targets[rt]->sent;
+          continue;
+        }
+        rate_dt = (int32_t)(tmp_time - rate_state[rt].since);
+        if (rate_dt < RATE_WINDOW_SEC)
+          continue;
+        rate_attempts = hydra_targets[rt]->sent - rate_state[rt].base;
+        rate_val = (double)rate_attempts / (double)rate_dt;
+        if (rate_val >= (double)min_rate)
+          rate_state[rt].slow = 0;
+        else
+          rate_state[rt].slow++;
+        rate_state[rt].since = tmp_time; // roll the window
+        rate_state[rt].base = hydra_targets[rt]->sent;
+        if (rate_state[rt].slow >= RATE_SLOW_LIMIT) {
+          if (verbose || debug)
+            printf("[STATUS] target %s:%d rate %.1f tries/sec below -j %d, "
+                   "skipping\n",
+                   hydra_targets[rt]->target, hydra_targets[rt]->port, rate_val, min_rate);
+          hydra_skip_target_blocked(rt);
+        }
+      }
+    }
 
     for (head_no = 0; head_no < hydra_options.max_use; head_no++) {
       if (debug > 1 && hydra_heads[head_no]->active != HEAD_DISABLED)
@@ -4381,8 +4558,11 @@ int main(int argc, char *argv[]) {
                     fprintf(hydra_brains.ofp, "[%d][%s] host: %s   login: %s   password: %s\n", hydra_targets[hydra_heads[head_no]->target_no]->port, hydra_options.service, hydra_targets[hydra_heads[head_no]->target_no]->target, hydra_heads[head_no]->current_login_ptr, hydra_heads[head_no]->current_pass_ptr);
                   fflush(hydra_brains.ofp);
                 }
+                hydra_add_found(hydra_targets[hydra_heads[head_no]->target_no]->port, hydra_options.service,
+                                hydra_targets[hydra_heads[head_no]->target_no]->target, hydra_targets[hydra_heads[head_no]->target_no]->miscptr,
+                                hydra_heads[head_no]->current_login_ptr, hydra_heads[head_no]->current_pass_ptr);
                 if (hydra_options.exit_found) { // option set says quit target after on
-                                                // valid login/pass pair is found
+                                                 // valid login/pass pair is found
                   if (hydra_targets[hydra_heads[head_no]->target_no]->done == TARGET_ACTIVE) {
                     hydra_targets[hydra_heads[head_no]->target_no]->done = TARGET_FINISHED; // mark target as done
                     hydra_brains.finished++;
@@ -4550,7 +4730,7 @@ int main(int argc, char *argv[]) {
   if (debug)
     printf("[DEBUG] while loop left with %d\n", exit_condition);
 
-  j = k = error = 0;
+  j = k = error = blocked = 0;
   for (i = 0; i < hydra_brains.targets; i++)
     switch (hydra_targets[i]->done) {
     case TARGET_UNRESOLVED:
@@ -4561,6 +4741,9 @@ int main(int argc, char *argv[]) {
         k++;
       else
         error++;
+      break;
+    case TARGET_BLOCKED:
+      blocked++;
       break;
     case TARGET_FINISHED:
       break;
@@ -4575,9 +4758,12 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "[ERROR] illegal target result value (%d=>%d)\n", i, hydra_targets[i]->done);
     }
 
-  printf("%d of %d target%s%scompleted, %" hPRIu64 " valid password", hydra_brains.targets - j - k - error, hydra_brains.targets, hydra_brains.targets == 1 ? " " : "s ", hydra_brains.found > 0 ? "successfully " : "", hydra_brains.found);
+  printf("%d of %d target%s%scompleted, %" hPRIu64 " valid password", hydra_brains.targets - j - k - error - blocked, hydra_brains.targets, hydra_brains.targets == 1 ? " " : "s ", hydra_brains.found > 0 ? "successfully " : "", hydra_brains.found);
   printf("%s", hydra_brains.found < 2 ? "" : "s");
   printf(" found\n");
+  if (blocked > 0)
+    printf("%d target%s skipped (below -j min rate, probably blocked)\n", blocked, blocked == 1 ? "" : "s");
+  hydra_print_found_all();
 
   error += j;
   // keep k as the target-derived count computed above: it is reported as a
@@ -4588,7 +4774,7 @@ int main(int argc, char *argv[]) {
     if (hydra_heads[i]->active == HEAD_ACTIVE)
       active_heads++;
 
-  if (error == 0 && active_heads == 0) {
+  if (error + blocked == 0 && active_heads == 0) {
     process_restore = 0;
     unlink(RESTOREFILE);
   } else {
@@ -4596,7 +4782,7 @@ int main(int argc, char *argv[]) {
     if (hydra_options.cidr == 0 && active_heads == 0) {
       printf("[INFO] Writing restore file because %d server scan%s could not "
              "be completed\n",
-             j + error, j + error == 1 ? "" : "s");
+             j + error + blocked, j + error + blocked == 1 ? "" : "s");
       hydra_restore_write(1);
     } else if (active_heads > 0) {
       printf("[WARNING] Writing restore file because %d final worker threads "

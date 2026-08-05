@@ -119,6 +119,11 @@ only makes sense if a low task number is used, .e.g \-t 1
 the wait time in seconds per login attempt over all threads (-t 1 is recommended)
 This usually only makes sense if a low task number is used, .e.g \-t 1
 .TP
+.B \-j N
+minimum tries per second per target. If the achieved attempt rate for a target
+stays below N for several seconds, the target is skipped (assumed blocked or
+throttled, e.g. by fail2ban). Disabled by \-c. Default: off.
+.TP
 .B \-4 / \-6 
 prefer IPv4 (default) or IPv6 addresses
 .TP
