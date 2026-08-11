@@ -217,6 +217,7 @@ char *SERVICES = "adam6500 asterisk afp cisco cisco-enable cobaltstrike cvs fire
 #define MAXLINESIZE ((MAXBUF / 2) - 4)
 #define MAXTASKS 256
 #define MAXSERVERS 16
+#define DEFAULT_MAX_USE 64 // default overall parallelism for -M (lower than MAXTASKS to avoid spawning hundreds of children by default)
 #define MAXFAIL 3
 #define MAXENDWAIT 20
 #define WAITTIME 32
@@ -229,7 +230,7 @@ char *SERVICES = "adam6500 asterisk afp cisco cisco-enable cobaltstrike cvs fire
 #define RESTOREFILE "./hydra.restore"
 
 #define PROGRAM "Hydra"
-#define VERSION "v9.8dev"
+#define VERSION "v9.9dev"
 #define AUTHOR "van Hauser/THC"
 #define EMAIL "<vh@thc.org>"
 #define AUTHOR2 "David Maciejak"
@@ -248,6 +249,8 @@ extern int32_t old_ssl;
 
 void hydra_kill_head(int32_t head_no, int32_t killit, int32_t fail);
 void hydra_skip_target_blocked(int32_t target_no);
+void target_redo_push(int32_t target_no, char *login, char *pass);
+void target_skip_push(int32_t target_no, char *username);
 void hydra_add_found(int32_t port, char *service, char *target, char *miscptr, char *login, char *password);
 void hydra_print_found_all(void);
 
@@ -284,13 +287,15 @@ typedef struct {
   int32_t fail_count;
   int32_t redo_state;
   int32_t redo;
+  int32_t redo_cap;   // allocated capacity of redo_login/redo_pass (lazy, 0 until first push)
   int32_t ok;
   int32_t failed;
   int32_t skipcnt;
+  int32_t skip_cap;   // allocated capacity of skiplogin (lazy, 0 until first push)
   int32_t port;
-  char *redo_login[MAXTASKS * 2 + 2];
-  char *redo_pass[MAXTASKS * 2 + 2];
-  char *skiplogin[SKIPLOGIN];
+  char **redo_login;  // NULL until first push; grown by redo_cap
+  char **redo_pass;
+  char **skiplogin;
   //  char *bfg_ptr[MAXTASKS];
 } hydra_target;
 
@@ -880,11 +885,13 @@ void hydra_restore_read() {
     fprintf(stderr, "[ERROR] restore file is prior hydra version v8.5!\n");
     exit(-1);
   }
-  if (buf[0] != VERSION[1] || buf[1] != VERSION[3])
+  if (buf[0] != VERSION[1] || buf[1] != VERSION[3]) {
     fprintf(stderr,
-            "[WARNING] restore file was created by version %c.%c, this is "
-            "version %s\n",
+            "[ERROR] restore file was created by version %c.%c, this is "
+            "version %s (incompatible binary layout - refusing to load)\n",
             buf[0], buf[1], VERSION);
+    exit(-1);
+  }
   if (buf[2] != sizeof(int32_t) % 256 || buf[3] != sizeof(hydra_head *) % 256) {
     fprintf(stderr, "[ERROR] restore file was created on a different, "
                     "incompatible processor platform!\n");
@@ -1018,15 +1025,18 @@ void hydra_restore_read() {
     hydra_targets[j]->miscptr = NULL;
     hydra_targets[j]->login_ptr = NULL;
     hydra_targets[j]->pass_ptr = NULL;
-    memset(hydra_targets[j]->redo_login, 0, sizeof(hydra_targets[j]->redo_login));
-    memset(hydra_targets[j]->redo_pass, 0, sizeof(hydra_targets[j]->redo_pass));
-    memset(hydra_targets[j]->skiplogin, 0, sizeof(hydra_targets[j]->skiplogin));
-    /* redo_login/redo_pass are sized MAXTASKS*2+2; skiplogin is sized SKIPLOGIN. */
-    if (hydra_targets[j]->redo < 0 || hydra_targets[j]->redo > MAXTASKS * 2 + 2) {
+    hydra_targets[j]->redo_login = NULL;
+    hydra_targets[j]->redo_pass = NULL;
+    hydra_targets[j]->redo_cap = 0;
+    hydra_targets[j]->skiplogin = NULL;
+    hydra_targets[j]->skip_cap = 0;
+    /* redo_login/redo_pass/skiplogin are now lazily allocated char**; the raw
+     * struct bytes above were re-initialised, the real entries are read below. */
+    if (hydra_targets[j]->redo < 0 || hydra_targets[j]->redo > hydra_options.max_use * 2) {
       fprintf(stderr, "[ERROR] restore file target %d redo count out of range (%d)\n", j, hydra_targets[j]->redo);
       exit(-1);
     }
-    if (hydra_targets[j]->skipcnt < 0 || hydra_targets[j]->skipcnt >= SKIPLOGIN) {
+    if (hydra_targets[j]->skipcnt < 0 || hydra_targets[j]->skipcnt > (int32_t)hydra_brains.countlogin) {
       fprintf(stderr, "[ERROR] restore file target %d skipcnt out of range (%d)\n", j, hydra_targets[j]->skipcnt);
       exit(-1);
     }
@@ -1066,6 +1076,13 @@ void hydra_restore_read() {
     if (hydra_targets[j]->redo > 0) {
       if (debug)
         printf("[DEBUG] target %d redo %d\n", j, hydra_targets[j]->redo);
+      hydra_targets[j]->redo_login = (char **)malloc(hydra_targets[j]->redo * sizeof(char *));
+      hydra_targets[j]->redo_pass = (char **)malloc(hydra_targets[j]->redo * sizeof(char *));
+      hydra_targets[j]->redo_cap = hydra_targets[j]->redo;
+      if (hydra_targets[j]->redo_login == NULL || hydra_targets[j]->redo_pass == NULL) {
+        fprintf(stderr, "[ERROR] restore file: out of memory allocating redo list for target %d\n", j);
+        exit(-1);
+      }
       for (i = 0; i < hydra_targets[j]->redo; i++) {
         sck = fgets(out, sizeof(out), f);
         if (out[0] != 0 && out[strlen(out) - 1] == '\n')
@@ -1081,7 +1098,13 @@ void hydra_restore_read() {
     }
     if (hydra_targets[j]->skipcnt >= hydra_brains.countlogin)
       hydra_targets[j]->skipcnt = 0;
-    if (hydra_targets[j]->skipcnt > 0)
+    if (hydra_targets[j]->skipcnt > 0) {
+      hydra_targets[j]->skiplogin = (char **)malloc(hydra_targets[j]->skipcnt * sizeof(char *));
+      hydra_targets[j]->skip_cap = hydra_targets[j]->skipcnt;
+      if (hydra_targets[j]->skiplogin == NULL) {
+        fprintf(stderr, "[ERROR] restore file: out of memory allocating skip list for target %d\n", j);
+        exit(-1);
+      }
       for (i = 0; i < hydra_targets[j]->skipcnt; i++) {
         sck = fgets(out, sizeof(out), f);
         if (out[0] != 0 && out[strlen(out) - 1] == '\n')
@@ -1089,6 +1112,7 @@ void hydra_restore_read() {
         hydra_targets[j]->skiplogin[i] = malloc(strlen(out) + 1);
         strcpy(hydra_targets[j]->skiplogin[i], out);
       }
+    }
     hydra_targets[j]->fail_count = 0;
     hydra_targets[j]->use_count = 0;
     hydra_targets[j]->failed = 0;
@@ -1687,6 +1711,61 @@ void hydra_skip_target_blocked(int32_t target_no) {
     }
 }
 
+// lazily grow a char** array to at least 'need' slots; returns 0 on OOM (caller
+// drops the entry rather than crashing). Allocates both arrays in lockstep.
+static int target_grow_pair(char ***login_arr, char ***pass_arr, int32_t *cap, int32_t need) {
+  int32_t nc = *cap ? *cap * 2 : 8;
+  while (nc < need)
+    nc *= 2;
+  char **nl = (char **)realloc(*login_arr, nc * sizeof(char *));
+  char **np = (char **)realloc(*pass_arr, nc * sizeof(char *));
+  if (nl == NULL || np == NULL) {
+    if (nl)
+      *login_arr = nl;
+    if (np)
+      *pass_arr = np;
+    return 0; // OOM: leave existing data intact, caller drops the new entry
+  }
+  *login_arr = nl;
+  *pass_arr = np;
+  *cap = nc;
+  return 1;
+}
+
+static int target_grow_single(char ***arr, int32_t *cap, int32_t need) {
+  int32_t nc = *cap ? *cap * 2 : 8;
+  while (nc < need)
+    nc *= 2;
+  char **n = (char **)realloc(*arr, nc * sizeof(char *));
+  if (n == NULL)
+    return 0;
+  *arr = n;
+  *cap = nc;
+  return 1;
+}
+
+// push a login/pass pair onto a target's redo list (lazy-allocated)
+void target_redo_push(int32_t target_no, char *login, char *pass) {
+  hydra_target *t = hydra_targets[target_no];
+  if (t->redo >= t->redo_cap && !target_grow_pair(&t->redo_login, &t->redo_pass, &t->redo_cap, t->redo + 1))
+    return; // OOM: drop this redo entry
+  t->redo_login[t->redo] = login;
+  t->redo_pass[t->redo] = pass;
+  t->redo++;
+}
+
+// push a username onto a target's skip list (lazy-allocated)
+void target_skip_push(int32_t target_no, char *username) {
+  hydra_target *t = hydra_targets[target_no];
+  if (t->skipcnt >= t->skip_cap && !target_grow_single(&t->skiplogin, &t->skip_cap, t->skipcnt + 1))
+    return; // OOM: drop this skip entry
+  t->skiplogin[t->skipcnt] = malloc(strlen(username) + 1);
+  if (t->skiplogin[t->skipcnt] == NULL)
+    return;
+  strcpy(t->skiplogin[t->skipcnt], username);
+  t->skipcnt++;
+}
+
 void hydra_increase_fail_count(int32_t target_no, int32_t head_no) {
   int32_t i, k, maxfail = 0;
 
@@ -1712,9 +1791,7 @@ void hydra_increase_fail_count(int32_t target_no, int32_t head_no) {
     if (k <= 1) {
       // we need to put this in a list, otherwise we fail one login+pw test
       if (hydra_targets[target_no]->done == TARGET_ACTIVE && hydra_options.skip_redo == 0 && hydra_targets[target_no]->redo <= hydra_options.max_use * 2 && ((hydra_heads[head_no]->current_login_ptr != empty_login && hydra_heads[head_no]->current_pass_ptr != empty_login) || (hydra_heads[head_no]->current_login_ptr != NULL && hydra_heads[head_no]->current_pass_ptr != NULL))) {
-        hydra_targets[target_no]->redo_login[hydra_targets[target_no]->redo] = hydra_heads[head_no]->current_login_ptr;
-        hydra_targets[target_no]->redo_pass[hydra_targets[target_no]->redo] = hydra_heads[head_no]->current_pass_ptr;
-        hydra_targets[target_no]->redo++;
+        target_redo_push(target_no, hydra_heads[head_no]->current_login_ptr, hydra_heads[head_no]->current_pass_ptr);
         total_redo_count++;
         if (debug)
           printf("[DEBUG] - will be retried at the end: ip %s - login %s - "
@@ -1746,9 +1823,7 @@ void hydra_increase_fail_count(int32_t target_no, int32_t head_no) {
     } else {
       // we need to put this in a list, otherwise we fail one login+pw test
       if (hydra_targets[target_no]->done == TARGET_ACTIVE && hydra_options.skip_redo == 0 && hydra_targets[target_no]->redo <= hydra_options.max_use * 2 && ((hydra_heads[head_no]->current_login_ptr != empty_login && hydra_heads[head_no]->current_pass_ptr != empty_login) || (hydra_heads[head_no]->current_login_ptr != NULL && hydra_heads[head_no]->current_pass_ptr != NULL))) {
-        hydra_targets[target_no]->redo_login[hydra_targets[target_no]->redo] = hydra_heads[head_no]->current_login_ptr;
-        hydra_targets[target_no]->redo_pass[hydra_targets[target_no]->redo] = hydra_heads[head_no]->current_pass_ptr;
-        hydra_targets[target_no]->redo++;
+        target_redo_push(target_no, hydra_heads[head_no]->current_login_ptr, hydra_heads[head_no]->current_pass_ptr);
         total_redo_count++;
         if (debug)
           printf("[DEBUG] - will be retried at the end: ip %s - login %s - "
@@ -2263,10 +2338,7 @@ void hydra_skip_user(int32_t target_no, char *username) {
     if (strcmp(username, hydra_targets[target_no]->skiplogin[i]) == 0)
       return;
 
-  if (hydra_targets[target_no]->skipcnt < SKIPLOGIN && (hydra_targets[target_no]->skiplogin[hydra_targets[target_no]->skipcnt] = malloc(strlen(username) + 1)) != NULL) {
-    strcpy(hydra_targets[target_no]->skiplogin[hydra_targets[target_no]->skipcnt], username);
-    hydra_targets[target_no]->skipcnt++;
-  }
+  target_skip_push(target_no, username);
   if (hydra_options.loop_mode == 0 && !check_flag(hydra_options.mode, MODE_COLON_FILE)) {
     if (strcmp(username, hydra_targets[target_no]->login_ptr) == 0) {
       if (debug)
@@ -2475,7 +2547,7 @@ int main(int argc, char *argv[]) {
   FILE *lfp = NULL, *pfp = NULL, *cfp = NULL, *ifp = NULL, *rfp = NULL, *proxyfp, *filecloser = NULL;
   size_t countinfile = 1, sizeinfile = 0;
   uint64_t math2;
-  int32_t i = 0, j = 0, k, error = 0, modusage = 0, ignore_restore = 0, do_switch, blocked = 0;
+  int32_t i = 0, j = 0, k, error = 0, modusage = 0, ignore_restore = 0, do_switch, blocked = 0, max_use_set = 0;
   int32_t head_no = 0, target_no = 0, exit_condition = 0, readres, active_heads = 0;
   int32_t rt, rate_dt;
   uint64_t rate_attempts;
@@ -2811,6 +2883,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "[ERROR] -T must be between 1 and %d\n", MAXTASKS * MAXSERVERS);
         exit(-1);
       }
+      max_use_set = 1;
       break;
     case 'U':
       modusage = 1;
@@ -4134,11 +4207,11 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  if (hydra_options.max_use == MAXTASKS) { // only if it was not set via -T
+  if (!max_use_set) { // only if it was not set via -T
     if (hydra_options.max_use < hydra_brains.targets * hydra_options.tasks)
       hydra_options.max_use = hydra_brains.targets * hydra_options.tasks;
-    if (hydra_options.max_use > MAXTASKS)
-      hydra_options.max_use = MAXTASKS;
+    if (hydra_options.max_use > DEFAULT_MAX_USE) // cap auto parallelism to keep the default child count low (explicit -T may go up to MAXTASKS*MAXSERVERS)
+      hydra_options.max_use = DEFAULT_MAX_USE;
   }
   if ((hydra_options.tasks == TASKS || hydra_options.tasks <= 8) && hydra_options.max_use < hydra_brains.targets * hydra_options.tasks) {
     if ((hydra_options.tasks = hydra_options.max_use / hydra_brains.targets) == 0)
