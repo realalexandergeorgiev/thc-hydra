@@ -11,6 +11,9 @@ have to add option -DWITH_SSH1=On in the cmake
 void dummy_ssh() { printf("\n"); }
 #else
 
+#include <errno.h>
+#include <string.h>
+
 #include <libssh/libssh.h>
 
 #if LIBSSH_VERSION_MAJOR == 0 && LIBSSH_VERSION_MINOR >= 4
@@ -20,6 +23,52 @@ ssh_session session = NULL;
 extern hydra_option hydra_options;
 extern const unsigned char HYDRA_EXIT[5];
 int32_t new_session = 1;
+
+/* number of connect retries when the failure is caused by fd exhaustion */
+#define SSH_CONNECT_FD_RETRIES 10
+
+/* (re)apply the common ssh session options */
+static void hydra_ssh_set_options(ssh_session session, char *ip, int32_t port, const char *user) {
+  ssh_options_set(session, SSH_OPTIONS_HOST, hydra_address2string(ip));
+  ssh_options_parse_config(session, NULL);
+  ssh_options_set(session, SSH_OPTIONS_PORT, &port);
+  ssh_options_set(session, SSH_OPTIONS_USER, user);
+  ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &hydra_options.waittime);
+  ssh_options_set(session, SSH_OPTIONS_COMPRESSION_C_S, "none");
+  ssh_options_set(session, SSH_OPTIONS_COMPRESSION_S_C, "none");
+  ssh_options_set(session, SSH_OPTIONS_KEY_EXCHANGE, "diffie-hellman-group-exchange-sha1,diffie-hellman-group14-sha1,curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group18-sha512,diffie-hellman-group16-sha512,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha256");
+  ssh_options_set(session, SSH_OPTIONS_HOSTKEYS, "ssh-rsa,ssh-dss,ssh-ed25519,ecdsa-sha2-nistp521,ecdsa-sha2-nistp384,ecdsa-sha2-nistp256,sk-ssh-ed25519@openssh.com,sk-ecdsa-sha2-nistp256@openssh.com,rsa-sha2-512,rsa-sha2-256");
+}
+
+/* connect with retry on fd exhaustion (EMFILE/ENFILE / "Too many open files").
+ * returns 0 on success, -1 otherwise. recreates the session on retry. */
+static int hydra_ssh_connect(ssh_session *session, char *ip, int32_t port, const char *user) {
+  int i;
+
+  for (i = 0; i <= SSH_CONNECT_FD_RETRIES; i++) {
+    if (ssh_connect(*session) == 0)
+      return 0;
+    if (i == SSH_CONNECT_FD_RETRIES)
+      break;
+    if (errno == EMFILE || errno == ENFILE || strstr(ssh_get_error(*session), "Too many open files") != NULL) {
+      if (verbose)
+        hydra_report(stderr, "[INFO] ssh fd limit reached, retrying connect to %s:%d (%d/%d)\n", hydra_address2string_beautiful(ip), port, i + 1, SSH_CONNECT_FD_RETRIES);
+      usleepn(100000 * (i + 1));
+      {
+        ssh_session ns = ssh_new();
+        if (ns == NULL)
+          return -1;
+        ssh_disconnect(*session);
+        ssh_free(*session);
+        *session = ns;
+      }
+      hydra_ssh_set_options(*session, ip, port, user);
+      continue;
+    }
+    return -1;
+  }
+  return -1;
+}
 
 int32_t start_ssh(int32_t s, char *ip, int32_t port, unsigned char options, char *miscptr, FILE *fp) {
   char *empty = "";
@@ -41,17 +90,8 @@ int32_t start_ssh(int32_t s, char *ip, int32_t port, unsigned char options, char
     }
 
     session = ssh_new();
-    ssh_options_set(session, SSH_OPTIONS_HOST, hydra_address2string(ip));
-    ssh_options_parse_config(session, NULL);
-    ssh_options_set(session, SSH_OPTIONS_PORT, &port);
-    ssh_options_set(session, SSH_OPTIONS_USER, login);
-    ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &hydra_options.waittime);
-    ssh_options_set(session, SSH_OPTIONS_COMPRESSION_C_S, "none");
-    ssh_options_set(session, SSH_OPTIONS_COMPRESSION_S_C, "none");
-    // might be better to add the legacy (first two for KEX and HOST) to the default instead of specifying the full list
-    ssh_options_set(session, SSH_OPTIONS_KEY_EXCHANGE, "diffie-hellman-group-exchange-sha1,diffie-hellman-group14-sha1,curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group18-sha512,diffie-hellman-group16-sha512,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha256");
-    ssh_options_set(session, SSH_OPTIONS_HOSTKEYS, "ssh-rsa,ssh-dss,ssh-ed25519,ecdsa-sha2-nistp521,ecdsa-sha2-nistp384,ecdsa-sha2-nistp256,sk-ssh-ed25519@openssh.com,sk-ecdsa-sha2-nistp256@openssh.com,rsa-sha2-512,rsa-sha2-256");
-    if (ssh_connect(session) != 0) {
+    hydra_ssh_set_options(session, ip, port, login);
+    if (hydra_ssh_connect(&session, ip, port, login) != 0) {
       // if the connection was drop, exit and let hydra main handle it
       if (verbose)
         hydra_report(stderr, "[ERROR] could not connect to target port %d: %s\n", port, ssh_get_error(session));
@@ -204,20 +244,8 @@ int32_t service_ssh_init(char *ip, int32_t sp, unsigned char options, char *misc
     printf("[INFO] Testing if password authentication is supported by "
            "ssh://%s@%s:%d\n",
            miscptr == NULL ? "hydra" : miscptr, hydra_address2string_beautiful(ip), port);
-  ssh_options_set(session, SSH_OPTIONS_HOST, hydra_address2string(ip));
-  ssh_options_parse_config(session, NULL);
-  ssh_options_set(session, SSH_OPTIONS_PORT, &port);
-  if (miscptr == NULL)
-    ssh_options_set(session, SSH_OPTIONS_USER, "hydra");
-  else
-    ssh_options_set(session, SSH_OPTIONS_USER, miscptr);
-  ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &hydra_options.waittime);
-  ssh_options_set(session, SSH_OPTIONS_COMPRESSION_C_S, "none");
-  ssh_options_set(session, SSH_OPTIONS_COMPRESSION_S_C, "none");
-  // might be better to add the legacy (first two for KEX and HOST) to the default instead of specifying the full list
-  ssh_options_set(session, SSH_OPTIONS_KEY_EXCHANGE, "diffie-hellman-group-exchange-sha1,diffie-hellman-group14-sha1,curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group18-sha512,diffie-hellman-group16-sha512,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha256");
-  ssh_options_set(session, SSH_OPTIONS_HOSTKEYS, "ssh-rsa,ssh-dss,ssh-ed25519,ecdsa-sha2-nistp521,ecdsa-sha2-nistp384,ecdsa-sha2-nistp256,sk-ssh-ed25519@openssh.com,sk-ecdsa-sha2-nistp256@openssh.com,rsa-sha2-512,rsa-sha2-256");
-  if (ssh_connect(session) != 0) {
+  hydra_ssh_set_options(session, ip, port, miscptr == NULL ? "hydra" : miscptr);
+  if (hydra_ssh_connect(&session, ip, port, miscptr == NULL ? "hydra" : miscptr) != 0) {
     fprintf(stderr, "[ERROR] could not connect to ssh://%s:%d - %s\n", hydra_address2string_beautiful(ip), port, ssh_get_error(session));
     return 2;
   }

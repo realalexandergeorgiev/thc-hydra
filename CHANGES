@@ -2,6 +2,12 @@ Changelog for hydra
 -------------------
 
 Release 9.8-dev
+* ssh module: retry connection on fd exhaustion (EMFILE/ENFILE / "Too many
+  open files") with exponential backoff instead of dropping the target; this
+  makes large list scans resilient when the per-process file-descriptor limit
+  is hit (e.g. with the raised default of -t 256). Lower -t or raise the
+  nofile limit (ulimit/limits.conf/systemd DefaultLimitNOFILE/fs.file-max) as
+  needed.
 * security fixes (some reported by Elpe Pinillo and TristanInSec):
   - hydra.restore deserialization: validate ownership, clamp length/count/
     offset fields before driving malloc and loop bounds

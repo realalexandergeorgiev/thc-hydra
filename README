@@ -433,6 +433,21 @@ Experiment with the task option (-t) to speed things up! The higher - the
 faster ;-) (but too high - and it disables the service)
 
 
+TROUBLESHOOTING
+--------------
+If you see `Socket create failed: Too many open files` (especially with the
+default `-t 256` on large lists), the per-process file-descriptor limit is
+being hit. Hydra now retries the SSH connection with a backoff in that case,
+but to avoid the errors entirely:
+- lower the task count, e.g. `-t 64`
+- raise the limit: `ulimit -n 65536`, and persist it via
+  `/etc/security/limits.conf` (`* soft/hard nofile 65536`) and, on systemd
+  hosts, `DefaultLimitNOFILE=65536` in `/etc/systemd/system.conf` followed by
+  `systemctl daemon-reexec`; also raise the system-wide maximum with
+  `sysctl -w fs.file-max=2097152`
+Note: a shell `ulimit -n unlimited` does not guarantee the limit for the
+actual hydra process - verify with `cat /proc/$(pidof hydra)/limits`.
+
 
 STATISTICS
 ----------
